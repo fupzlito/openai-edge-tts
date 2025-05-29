@@ -7,6 +7,8 @@ import subprocess
 import os
 from pathlib import Path
 
+from langdetect import detect, LangDetectException
+
 from utils import DETAILED_ERROR_LOGGING
 from config import DEFAULT_CONFIGS
 
@@ -23,8 +25,13 @@ voice_mapping = {
     'shimmer': 'en-US-EmmaNeural'
 }
 
+# Language fallback voices
+MULTILINGUAL_VOICE = "en-US-AndrewMultilingualNeural"
+LANGUAGE_VOICE_OVERRIDES = {
+    "ru": "ru-RU-DmitryNeural"
+}
+
 def is_ffmpeg_installed():
-    """Check if FFmpeg is installed and accessible."""
     try:
         subprocess.run(['ffmpeg', '-version'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return True
@@ -32,51 +39,39 @@ def is_ffmpeg_installed():
         return False
 
 async def _generate_audio(text, voice, response_format, speed):
-    """Generate TTS audio and optionally convert to a different format."""
-    # Determine if the voice is an OpenAI-compatible voice or a direct edge-tts voice
-    edge_tts_voice = voice_mapping.get(voice, voice)  # Use mapping if in OpenAI names, otherwise use as-is
-
-    # Generate the TTS output in mp3 format first
     temp_mp3_file_obj = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
     temp_mp3_path = temp_mp3_file_obj.name
 
-    # Convert speed to SSML rate format
     try:
-        speed_rate = speed_to_rate(speed)  # Convert speed value to "+X%" or "-X%"
+        speed_rate = speed_to_rate(speed)
     except Exception as e:
         print(f"Error converting speed: {e}. Defaulting to +0%.")
         speed_rate = "+0%"
 
-    # Generate the MP3 file
-    communicator = edge_tts.Communicate(text=text, voice=edge_tts_voice, rate=speed_rate)
+    communicator = edge_tts.Communicate(text=text, voice=voice, rate=speed_rate)
     await communicator.save(temp_mp3_path)
-    temp_mp3_file_obj.close() # Explicitly close our file object for the initial mp3
+    temp_mp3_file_obj.close()
 
-    # If the requested format is mp3, return the generated file directly
     if response_format == "mp3":
         return temp_mp3_path
 
-    # Check if FFmpeg is installed
     if not is_ffmpeg_installed():
         print("FFmpeg is not available. Returning unmodified mp3 file.")
-        return temp_mp3_path # Return the original mp3 path, it won't be cleaned by this function
+        return temp_mp3_path
 
-    # Create a new temporary file for the converted output
     converted_file_obj = tempfile.NamedTemporaryFile(delete=False, suffix=f".{response_format}")
     converted_path = converted_file_obj.name
-    converted_file_obj.close() # Close file object, ffmpeg will write to the path
+    converted_file_obj.close()
 
-    # Build the FFmpeg command
     ffmpeg_command = [
-        "ffmpeg",
-        "-i", temp_mp3_path,  # Input file path
+        "ffmpeg", "-i", temp_mp3_path,
         "-c:a", {
             "aac": "aac",
             "mp3": "libmp3lame",
             "wav": "pcm_s16le",
             "opus": "libopus",
             "flac": "flac"
-        }.get(response_format, "aac"),  # Default to AAC if unknown
+        }.get(response_format, "aac")
     ]
 
     if response_format != "wav":
@@ -84,40 +79,49 @@ async def _generate_audio(text, voice, response_format, speed):
 
     ffmpeg_command.extend([
         "-f", {
-            "aac": "mp4",  # AAC in MP4 container
+            "aac": "mp4",
             "mp3": "mp3",
             "wav": "wav",
             "opus": "ogg",
             "flac": "flac"
-        }.get(response_format, response_format),  # Default to matching format
-        "-y",  # Overwrite without prompt
-        converted_path  # Output file path
+        }.get(response_format, response_format),
+        "-y", converted_path
     ])
 
     try:
-        # Run FFmpeg command and ensure no errors occur
         subprocess.run(ffmpeg_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError as e:
-        # Clean up potentially created (but incomplete) converted file
         Path(converted_path).unlink(missing_ok=True)
-        # Clean up the original mp3 file as well, since conversion failed
         Path(temp_mp3_path).unlink(missing_ok=True)
-        
-        if DETAILED_ERROR_LOGGING:
-            error_message = f"FFmpeg error during audio conversion. Command: '{' '.join(e.cmd)}'. Stderr: {e.stderr.decode('utf-8', 'ignore')}"
-            print(error_message) # Log for server-side diagnosis
-        else:
-            error_message = f"FFmpeg error during audio conversion: {e}"
-            print(error_message) # Log a simpler message
-        raise RuntimeError(f"FFmpeg error during audio conversion: {e}") # The raised error will still have details via e
 
-    # Clean up the original temporary file (original mp3) as it's now converted
+        error_message = (
+            f"FFmpeg error during audio conversion. Command: '{' '.join(e.cmd)}'. "
+            f"Stderr: {e.stderr.decode('utf-8', 'ignore')}" if DETAILED_ERROR_LOGGING
+            else f"FFmpeg error during audio conversion: {e}"
+        )
+        print(error_message)
+        raise RuntimeError(error_message)
+
     Path(temp_mp3_path).unlink(missing_ok=True)
-
     return converted_path
 
 def generate_speech(text, voice, response_format, speed=1.0):
-    return asyncio.run(_generate_audio(text, voice, response_format, speed))
+    try:
+        detected_lang = detect(text)
+    except LangDetectException:
+        detected_lang = "en"
+
+    mapped_voice = voice_mapping.get(voice, voice)
+
+    if mapped_voice.startswith("en-") and "Multilingual" not in mapped_voice:
+        if detected_lang in LANGUAGE_VOICE_OVERRIDES:
+            print(f"[TTS] Detected {detected_lang} — using {LANGUAGE_VOICE_OVERRIDES[detected_lang]}")
+            mapped_voice = LANGUAGE_VOICE_OVERRIDES[detected_lang]
+        elif detected_lang != "en":
+            print(f"[TTS] Detected non-English ({detected_lang}) — using multilingual voice")
+            mapped_voice = MULTILINGUAL_VOICE
+
+    return asyncio.run(_generate_audio(text, mapped_voice, response_format, speed))
 
 def get_models():
     return [
@@ -126,33 +130,18 @@ def get_models():
     ]
 
 async def _get_voices(language=None):
-    # List all voices, filter by language if specified
     all_voices = await edge_tts.list_voices()
-    language = language or DEFAULT_LANGUAGE  # Use default if no language specified
-    filtered_voices = [
+    language = language or DEFAULT_LANGUAGE
+    return [
         {"name": v['ShortName'], "gender": v['Gender'], "language": v['Locale']}
         for v in all_voices if language == 'all' or language is None or v['Locale'] == language
     ]
-    return filtered_voices
 
 def get_voices(language=None):
     return asyncio.run(_get_voices(language))
 
 def speed_to_rate(speed: float) -> str:
-    """
-    Converts a multiplicative speed value to the edge-tts "rate" format.
-    
-    Args:
-        speed (float): The multiplicative speed value (e.g., 1.5 for +50%, 0.5 for -50%).
-    
-    Returns:
-        str: The formatted "rate" string (e.g., "+50%" or "-50%").
-    """
     if speed < 0 or speed > 2:
         raise ValueError("Speed must be between 0 and 2 (inclusive).")
-
-    # Convert speed to percentage change
     percentage_change = (speed - 1) * 100
-
-    # Format with a leading "+" or "-" as required
     return f"{percentage_change:+.0f}%"
